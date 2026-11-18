@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 from pathlib import Path
 
 from lab8.console import utf8_stdio
@@ -33,8 +34,106 @@ def integrity_check(pr: dict, base: dict, spec: dict, base_spec: dict | None = N
         including dropping no_significant_drop)
       - an item's slice tags in PR rows differ from the baseline's (relabelling an item out of a
         slice hides its regression from the slice gate)"""
-    # TODO M7
-    return []
+    problems: list[str] = []
+    manifest = pr.get("manifest") or {}
+    rows = pr.get("rows")
+    base_rows = base.get("rows")
+    metrics = pr.get("metrics") or {}
+
+    def finite(value: object) -> bool:
+        if isinstance(value, bool) or not isinstance(value, (int, float)):
+            return True
+        return math.isfinite(value)
+
+    for metric, value in metrics.items():
+        if not finite(value):
+            problems.append(f"metric {metric} is non-finite")
+
+    if not isinstance(rows, list):
+        problems.append("rows is missing or is not a list")
+        rows = []
+    if not isinstance(base_rows, list):
+        problems.append("baseline rows is missing or is not a list")
+        base_rows = []
+
+    def row_keys(data: list) -> tuple[list[tuple[object, object]], set[tuple[object, object]]]:
+        keys = []
+        for row in data:
+            if not isinstance(row, dict) or "item_id" not in row or "seed" not in row:
+                problems.append("row is missing item_id or seed")
+                continue
+            keys.append((row["item_id"], row["seed"]))
+        return keys, set(keys)
+
+    keys, key_set = row_keys(rows)
+    base_keys, base_key_set = row_keys(base_rows)
+    expected = manifest.get("items", 0) * len(manifest.get("seeds") or [])
+    if len(rows) != expected:
+        problems.append(f"row count {len(rows)} != manifest items×seeds {expected}")
+    if len(key_set) != len(keys):
+        problems.append("duplicate (item_id, seed) rows")
+    if key_set != base_key_set:
+        problems.append("(item_id, seed) set differs from baseline")
+    if len(base_key_set) != len(base_keys):
+        problems.append("baseline has duplicate (item_id, seed) rows")
+
+    failures = pr.get("evaluator_failures")
+    if failures:
+        problems.append(f"evaluator_failures is non-empty ({len(failures) if isinstance(failures, list) else 'present'})")
+    for item in spec.get("metrics", []):
+        metric = item.get("id")
+        for row in rows:
+            if metric in row and row[metric] is None:
+                problems.append(f"metric {metric} has None in row {row.get('item_id')}@{row.get('seed')}")
+                break
+
+    # Tags are part of evaluation provenance: changing them can remove a failing row from a slice.
+    base_tags = {(row["item_id"], row["seed"]): tuple(sorted(row.get("slices") or [])) for row in base_rows
+                 if isinstance(row, dict) and "item_id" in row and "seed" in row}
+    for row in rows:
+        if isinstance(row, dict) and "item_id" in row and "seed" in row:
+            key = (row["item_id"], row["seed"])
+            if key in base_tags and tuple(sorted(row.get("slices") or [])) != base_tags[key]:
+                problems.append(f"slice tags changed for {key[0]}@{key[1]}")
+                break
+
+    same_version = base_spec is not None and spec.get("eval_set_version") == base_spec.get("eval_set_version")
+    if same_version:
+        old_metrics = {m.get("id"): m for m in base_spec.get("metrics", [])}
+        new_metrics = {m.get("id"): m for m in spec.get("metrics", [])}
+        for mid, old in old_metrics.items():
+            new = new_metrics.get(mid)
+            if new is None:
+                problems.append(f"ratchet removed metric {mid}")
+                continue
+            if old.get("blocking") and not new.get("blocking"):
+                problems.append(f"ratchet made metric {mid} non-blocking")
+            old_th, new_th = old.get("threshold") or {}, new.get("threshold") or {}
+            if old_th.get("no_significant_drop") and not new_th.get("no_significant_drop"):
+                problems.append(f"ratchet removed no_significant_drop for {mid}")
+            for direction in ("min", "max", "max_increase"):
+                before, after = old_th.get(direction), new_th.get(direction)
+                if before is not None and (after is None or (after < before if direction == "min" else after > before)):
+                    problems.append(f"ratchet loosened {direction} for {mid}")
+
+        old_slices = {s.get("name"): s for s in base_spec.get("slices", [])}
+        new_slices = {s.get("name"): s for s in spec.get("slices", [])}
+        for name, old in old_slices.items():
+            new = new_slices.get(name)
+            if new is None:
+                problems.append(f"ratchet removed slice {name}")
+                continue
+            for field in ("metric",):
+                if old.get(field) != new.get(field):
+                    problems.append(f"ratchet changed {field} for slice {name}")
+            if old.get("blocking") and not new.get("blocking"):
+                problems.append(f"ratchet made slice {name} non-blocking")
+            if old.get("no_significant_drop") and not new.get("no_significant_drop"):
+                problems.append(f"ratchet removed no_significant_drop for slice {name}")
+            before, after = old.get("min"), new.get("min")
+            if before is not None and (after is None or after < before):
+                problems.append(f"ratchet loosened min for slice {name}")
+    return problems
 
 
 def slice_check(pr: dict, base: dict, spec: dict) -> tuple[list[str], list[str]]:

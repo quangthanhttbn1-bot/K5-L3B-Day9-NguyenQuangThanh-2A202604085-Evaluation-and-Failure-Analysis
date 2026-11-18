@@ -63,6 +63,31 @@ def test_integrity_flags_loosened_spec():
     assert gate.integrity_check(base, base, SPEC, SPEC) == []
 
 
+def test_integrity_flags_duplicate_rows_and_green_run_evaluator_failure():
+    from lab9 import gate
+
+    base = _report(copy.deepcopy(ROWS), {"pass_rate": 1.0})
+    duplicate = _report(copy.deepcopy(ROWS[:-1]) + [copy.deepcopy(ROWS[0])], {"pass_rate": 1.0})
+    assert any("duplicate" in p for p in gate.integrity_check(duplicate, base, SPEC))
+    green_with_failure = copy.deepcopy(base)
+    green_with_failure["evaluator_failures"] = ["grader raised on an otherwise passing row"]
+    assert any("evaluator_failures" in p for p in gate.integrity_check(green_with_failure, base, SPEC))
+
+
+def test_integrity_ratchets_slices_and_preserves_row_tags():
+    from lab9 import gate
+
+    base = _report(copy.deepcopy(ROWS), {"pass_rate": 1.0})
+    base_spec = copy.deepcopy(SPEC)
+    base_spec["slices"] = [{"name": "denial", "metric": "pass_rate", "min": 0.8,
+                            "no_significant_drop": True, "blocking": True}]
+    no_slice = copy.deepcopy(SPEC)
+    assert any("removed slice" in p for p in gate.integrity_check(base, base, no_slice, base_spec))
+    relabeled = copy.deepcopy(base)
+    relabeled["rows"][0]["slices"] = []
+    assert any("slice tags changed" in p for p in gate.integrity_check(relabeled, base, SPEC))
+
+
 def test_slice_check_blocks_a_slice_below_floor():
     from lab9 import gate
 
