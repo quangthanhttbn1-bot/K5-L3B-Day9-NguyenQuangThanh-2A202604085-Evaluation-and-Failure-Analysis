@@ -5,8 +5,9 @@
     python -m lab9.eval --shape swarm --spec config/metric_spec_v2.yaml --out reports/baseline_v2.json
     python -m lab9.eval --shape swarm --seeds 66,77,88,99,110   # A/A noise check (M6)
 
-Each (item, seed) is one pydantic-evals Case. The task runs the shape on a fresh
-SQLite store and returns a Trial; graders in lab9.graders score it. Reports are
+Each (item, seed) is one evaluation case. The task runs the shape on a fresh
+SQLite store and returns a Trial; graders in lab9.graders score it. Cases run
+synchronously to avoid a Windows asyncio loopback bootstrap hang. Reports are
 written by this script only -- never edit reports/ by hand.
 """
 
@@ -19,10 +20,10 @@ import tempfile
 import time
 from datetime import date
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 
 import yaml
-from pydantic_evals import Case, Dataset
 
 from lab8.benchmark import prepare_from_memory, run_trial
 from lab8.console import utf8_stdio
@@ -84,25 +85,30 @@ def run_eval(shape: str, spec: dict[str, Any], seeds: list[int] | None = None) -
     seeds = list(seeds or spec["seeds"])
     slices_of = {it["item_id"]: list(it.get("slices") or []) for it in items}
     metric_ids = [m["id"] for m in spec["metrics"] if m["id"] in GRADERS]
-    cases = [Case(name=f"{it['item_id']}@{s}", inputs={"claim_id": it["claim_id"], "seed": s},
-                  expected_output=labels[it["claim_id"]], metadata={"item_id": it["item_id"], "seed": s})
-             for it in items for s in seeds]
-    dataset = Dataset(name=f"logix-{spec['eval_set_version']}", cases=cases,
-                      evaluators=[GRADERS[m]() for m in metric_ids])
+    graders = {m: GRADERS[m]() for m in metric_ids}
     with tempfile.TemporaryDirectory(prefix="lab9-eval-", ignore_cleanup_errors=True) as tmp:
-        # max_concurrency=1: shapes write traces/ and SQLite; keep runs deterministic.
-        report = dataset.evaluate_sync(make_task(shape, world, claims, labels, Path(tmp)),
-                                       max_concurrency=1, progress=False)
+        # Run synchronously in fixed order. This preserves deterministic traces while
+        # avoiding asyncio's Windows loopback socket bootstrap, which can hang in
+        # restricted environments where socketpair falls back to a blocked TCP listener.
+        task = make_task(shape, world, claims, labels, Path(tmp))
+        evaluated, failures = [], []
+        for item in items:
+            for seed in seeds:
+                trial = task({"claim_id": item["claim_id"], "seed": seed})
+                ctx = SimpleNamespace(output=trial, expected_output=labels[item["claim_id"]])
+                scores = {}
+                for metric, grader in graders.items():
+                    try:
+                        scores[metric] = bool(grader.evaluate(ctx).value)
+                    except Exception as exc:
+                        scores[metric] = None
+                        failures.append(f"{item['item_id']}@{seed}:{type(grader).__name__}:{str(exc)[:80]}")
+                evaluated.append((item, seed, trial, scores))
     rows = []
-    for c in report.cases:
-        scores = {}
-        for m, g in zip(metric_ids, (GRADERS[m].__name__ for m in metric_ids)):
-            res = c.assertions.get(g)
-            scores[m] = None if res is None else bool(res.value)
-        rows.append({"item_id": c.metadata["item_id"], "seed": c.metadata["seed"],
-                     "slices": slices_of.get(c.metadata["item_id"], []), **scores,
-                     "cost": float(c.output["result"].get("cost_estimate") or 0.0)})
-    failures = [f"{c.name}:{f.name}:{f.error_message[:80]}" for c in report.cases for f in c.evaluator_failures]
+    for item, seed, trial, scores in evaluated:
+        rows.append({"item_id": item["item_id"], "seed": seed,
+                     "slices": slices_of.get(item["item_id"], []), **scores,
+                     "cost": float(trial["result"].get("cost_estimate") or 0.0)})
     eval_set_sha = evalset.sha12(Path(spec["eval_set"]))
     run_id = f"E-{shape}-{date.today():%Y%m%d}-{eval_set_sha[:4]}"
     return {"run_id": run_id, "shape": shape,
